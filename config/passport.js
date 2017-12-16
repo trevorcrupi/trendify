@@ -7,11 +7,22 @@ const TwitterStrategy = require('passport-twitter').Strategy;
 const GitHubStrategy = require('passport-github').Strategy;
 const GoogleStrategy = require('passport-google-oauth').OAuth2Strategy;
 const LinkedInStrategy = require('passport-linkedin-oauth2').Strategy;
+const SpotifyStrategy = require('passport-spotify').Strategy;
 const OpenIDStrategy = require('passport-openid').Strategy;
 const OAuthStrategy = require('passport-oauth').OAuthStrategy;
 const OAuth2Strategy = require('passport-oauth').OAuth2Strategy;
+const Kafka = require('node-rdkafka');
 
 const User = require('../models/User');
+
+const activity = require('../config/activity');
+
+const producer = new Kafka.Producer({
+  'metadata.broker.list': 'localhost:9092',
+  dr_cb: true
+});
+producer.connect();
+
 
 passport.serializeUser((user, done) => {
   done(null, user.id);
@@ -57,6 +68,77 @@ passport.use(new LocalStrategy({ usernameField: 'email' }, (email, password, don
  *       - Else create a new account.
  */
 
+/**
+ * Sign in with Spotify
+ */
+passport.use(new SpotifyStrategy({
+  clientID: process.env.SPOTIFY_ID,
+  clientSecret: process.env.SPOTIFY_SECRET,
+  callbackURL: 'http://localhost:8080/auth/spotify/callback',
+  profileFields: ['name', 'email', 'link', 'locale', 'timezone', 'gender'],
+  passReqToCallback: true
+}, (req, accessToken, refreshToken, profile, done) => {
+  if (req.user) {
+    User.findOne({ spotify: profile.id }, (err, existingUser) => {
+      if (err) { return done(err); }
+      if (existingUser) {
+        req.flash('errors', { msg: 'There is already a Spotify account that belongs to you. Sign in with that account.' });
+        done(err);
+      } else {
+        User.findById(req.user.id, (err, user) => {
+          if (err) { return done(err); }
+          console.log(profile);
+          user.spotify = profile.id;
+          user.tokens.push({ kind: 'spotify', accessToken });
+          user.profile.name = user.profile.name || `${profile.displayName}`;
+          user.profile.gender = user.profile.gender || '';
+          user.profile.picture = user.profile.picture || profile.photos[0];
+          user.save((err) => {
+            req.flash('info', { msg: 'Spotify account has been linked.' });
+            done(err, user);
+          });
+        });
+      }
+    });
+  } else {
+    User.findOne({ spotify: profile.id }, (err, existingUser) => {
+      if (err) { return done(err); }
+      if (existingUser) {
+        return done(null, existingUser);
+      }
+      User.findOne({ email: profile.email }, (err, existingEmailUser) => {
+        if (err) { return done(err); }
+        if (existingEmailUser) {
+          req.flash('errors', { msg: 'There is already an account using this email address. Sign in to that account and link it with Spotify manually from Account Settings.' });
+          done(err);
+        } else {
+          const user = new User();
+          user.email = profile._json.email;
+          user.spotify = profile.id;
+          user.tokens.push({ kind: 'spotify', accessToken });
+          user.profile.name = profile.displayName;
+          user.profile.gender = '';
+          user.profile.picture = profile.photos[0];
+          user.profile.location = profile.country;
+
+          // Send ACCOUNT_CREATED event to Kafka :)
+          try {
+            producer.produce('user_activity_stream', null, new Buffer(activity.USER_CREATED_SPOTIFY_ACCOUNT), 'activity', Date.now());
+          } catch (err) {
+            console.error('A problem occurred when sending our message');
+            console.error(err);
+          } finally {
+            producer.disconnect();
+          }
+
+          user.save((err) => {
+            done(err, user);
+          });
+        }
+      });
+    });
+  }
+}));
 /**
  * Sign in with Facebook.
  */
